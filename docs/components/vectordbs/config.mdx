@@ -6,7 +6,7 @@ title: Configurations
 
 The `config` is defined as an object with two main keys:
 - `vector_store`: Specifies the vector database provider and its configuration
-  - `provider`: The name of the vector database (e.g., "chroma", "pgvector", "qdrant", "milvus", "upstash_vector", "azure_ai_search", "vertex_ai_vector_search", "valkey")
+  - `provider`: The name of the vector database (e.g., "chroma", "pgvector", "qdrant", "milvus", "upstash_vector", "azure_ai_search", "vertex_ai_vector_search", "valkey", "lancedb")
   - `config`: A nested dictionary containing provider-specific settings
 
 
@@ -77,6 +77,7 @@ Here's a comprehensive list of all parameters that can be used across different 
 | `embedding_model_dims` | Dimensions of the embedding model |
 | `client` | Custom client for the database |
 | `path` | Path for the database |
+| `uri` | Filesystem path or LanceDB URI |
 | `host` | Host where the server is running |
 | `port` | Port where the server is running |
 | `user` | Username for database connection |
@@ -85,6 +86,9 @@ Here's a comprehensive list of all parameters that can be used across different 
 | `url` | Full URL for the server |
 | `api_key` | API key for the server |
 | `on_disk` | Enable persistent storage |
+| `table_name` | Override the underlying table name |
+| `distance_metric` | Search distance metric (for LanceDB) |
+| `storage_options` | Storage backend options passed to the provider |
 | `endpoint_id` | Endpoint ID (vertex_ai_vector_search) |
 | `index_id` | Index ID (vertex_ai_vector_search) |
 | `deployment_index_id` | Deployment index ID (vertex_ai_vector_search) |

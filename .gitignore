@@ -186,3 +186,6 @@ eval/
 qdrant_storage/
 .crossnote
 testing.ipynb
+
+tmp*
+docs/dev-memory.md

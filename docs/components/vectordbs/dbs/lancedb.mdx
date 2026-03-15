@@ -1,0 +1,60 @@
+[LanceDB](https://lancedb.com/) is a local-first vector database built on top of Lance columnar storage. It works well for self-hosted memory workloads because it runs directly on the local filesystem and supports SQL-style metadata filters.
+
+### Usage
+
+```python
+import os
+from mem0 import Memory
+
+os.environ["OPENAI_API_KEY"] = "sk-xx"
+
+config = {
+    "vector_store": {
+        "provider": "lancedb",
+        "config": {
+            "collection_name": "mem0_local",
+            "uri": "./.mem0/lancedb",
+            "embedding_model_dims": 1536,
+            "distance_metric": "cosine"
+        }
+    }
+}
+
+m = Memory.from_config(config)
+messages = [
+    {"role": "user", "content": "I like sci-fi movies and weekend city breaks."},
+    {"role": "assistant", "content": "Understood. I will bias future suggestions toward sci-fi and short trips."}
+]
+m.add(messages, user_id="alice", metadata={"category": "preferences"})
+```
+
+### Installation
+
+```bash
+pip install lancedb
+```
+
+If you are installing mem0 from source and want the full vector store extras:
+
+```bash
+pip install -e ".[vector_stores]"
+```
+
+### Config
+
+Here are the parameters available for configuring LanceDB:
+
+| Parameter | Description | Default Value |
+| --- | --- | --- |
+| `collection_name` | Logical collection name used by mem0 | `mem0` |
+| `uri` | Filesystem path or LanceDB URI | `./lancedb` |
+| `table_name` | Optional table override; falls back to `collection_name` | `None` |
+| `embedding_model_dims` | Dimension of the embedding vector | `1536` |
+| `distance_metric` | Search distance metric (`cosine`, `l2`, `dot`) | `cosine` |
+| `storage_options` | Optional storage backend options passed to `lancedb.connect` | `None` |
+
+### Notes
+
+1. LanceDB keeps data on disk under the configured `uri`, so it is a good fit for a local SDK build.
+2. Mem0 stores the full memory payload plus typed scalar columns for filterable metadata like `user_id`, `agent_id`, `run_id`, and custom scalar fields.
+3. Metadata filters map to LanceDB SQL expressions, so equality, ranges, `in`, and string `contains` queries work on scalar metadata fields.

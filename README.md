@@ -95,6 +95,34 @@ Install sdk via npm:
 npm install mem0ai
 ```
 
+### Local SDK with LanceDB
+
+If you want a filesystem-backed local vector store, build or install mem0 with LanceDB support and point the vector store to a local `uri`:
+
+```bash
+pip install -e ".[vector_stores]"
+python -m build
+pip install .\\dist\\mem0ai-1.0.5-py3-none-any.whl lancedb
+```
+
+```python
+from mem0 import Memory
+
+config = {
+    "vector_store": {
+        "provider": "lancedb",
+        "config": {
+            "collection_name": "mem0_local",
+            "uri": "./.mem0/lancedb",
+            "embedding_model_dims": 1536,
+            "distance_metric": "cosine",
+        },
+    }
+}
+
+memory = Memory.from_config(config)
+```
+
 ### Basic Usage
 
 Mem0 requires an LLM to function, with `gpt-4.1-nano-2025-04-14 from OpenAI as the default. However, it supports a variety of LLMs; for details, refer to our [Supported LLMs documentation](https://docs.mem0.ai/components/llms/overview).
