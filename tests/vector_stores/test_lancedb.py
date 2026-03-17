@@ -113,6 +113,74 @@ def test_lancedb_crud_and_filtering(lancedb_store: LanceDB):
     assert lancedb_store.get("mem-1") is None
 
 
+def test_lancedb_supports_keyword_search_and_batch_delete(lancedb_store: LanceDB):
+    lancedb_store.insert(
+        vectors=[
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        payloads=[
+            {
+                "data": "TypeScript strict mode rollout checklist",
+                "user_id": "alice",
+                "tags": ["typescript", "strict"],
+                "topic": "frontend",
+            },
+            {
+                "data": "Chrome DevTools MCP timeout handling SOP",
+                "user_id": "alice",
+                "tags": ["mcp", "timeout"],
+                "topic": "ops",
+            },
+            {
+                "data": "Rust service deployment notes",
+                "user_id": "bob",
+                "tags": ["rust", "deploy"],
+                "topic": "backend",
+            },
+        ],
+        ids=["kw-1", "kw-2", "kw-3"],
+    )
+
+    keyword_hits = lancedb_store.search_keyword(
+        "TypeScript strict",
+        limit=5,
+        filters={"user_id": "alice"},
+    )
+
+    assert keyword_hits
+    assert keyword_hits[0].id == "kw-1"
+    assert "kw-1" in [hit.id for hit in keyword_hits]
+    assert keyword_hits[0].source == "keyword"
+    assert keyword_hits[0].score is not None
+
+    candidate_sets = lancedb_store.search_hybrid_candidates(
+        query="timeout",
+        vectors=[0.0, 1.0, 0.0],
+        semantic_limit=3,
+        keyword_limit=3,
+        filters={"user_id": "alice"},
+    )
+
+    index_names = {str(getattr(index, "name", "") or "") for index in lancedb_store.table.list_indices()}
+    assert "user_id_idx" in index_names
+    assert "agent_id_idx" in index_names
+    assert "run_id_idx" in index_names
+    assert "search_text_idx" in index_names
+
+    assert [hit.id for hit in candidate_sets["semantic"]] == ["kw-2", "kw-1"]
+    assert candidate_sets["keyword"]
+    assert candidate_sets["keyword"][0].id == "kw-2"
+    assert "kw-2" in [hit.id for hit in candidate_sets["keyword"]]
+    assert lancedb_store.count({"user_id": "alice"}) == 2
+
+    deleted = lancedb_store.delete_many({"user_id": "alice"})
+    assert deleted == 2
+    assert lancedb_store.count({"user_id": "alice"}) == 0
+    assert lancedb_store.count({"user_id": "bob"}) == 1
+
+
 def test_lancedb_adds_dynamic_columns_across_batches(lancedb_store: LanceDB):
     lancedb_store.insert(
         vectors=[[1.0, 0.0, 0.0]],

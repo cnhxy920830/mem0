@@ -22,7 +22,6 @@ def memory_instance():
         patch("mem0.memory.main.VectorStoreFactory") as mock_vector_store,
         patch("mem0.utils.factory.LlmFactory") as mock_llm,
         patch("mem0.memory.telemetry.capture_event"),
-        patch("mem0.memory.graph_memory.MemoryGraph"),
         patch("mem0.memory.main.GraphStoreFactory") as mock_graph_store,
     ):
         mock_embedder.create.return_value = Mock()
@@ -46,7 +45,6 @@ def memory_custom_instance():
         patch("mem0.memory.main.VectorStoreFactory") as mock_vector_store,
         patch("mem0.utils.factory.LlmFactory") as mock_llm,
         patch("mem0.memory.telemetry.capture_event"),
-        patch("mem0.memory.graph_memory.MemoryGraph"),
         patch("mem0.memory.main.GraphStoreFactory") as mock_graph_store,
     ):
         mock_embedder.create.return_value = Mock()
@@ -194,14 +192,22 @@ def test_delete(memory_instance):
 def test_delete_all(memory_instance, version, enable_graph):
     memory_instance.config.version = version
     memory_instance.enable_graph = enable_graph
-    mock_memories = [Mock(id="1"), Mock(id="2")]
+    mock_memories = [
+        Mock(id="1", payload={"data": "Memory 1", "actor_id": "actor-1", "role": "user"}),
+        Mock(id="2", payload={"data": "Memory 2", "actor_id": "actor-2", "role": "assistant"}),
+    ]
+    memory_instance.vector_store.count = Mock(return_value=2)
     memory_instance.vector_store.list = Mock(return_value=(mock_memories, None))
-    memory_instance._delete_memory = Mock()
+    memory_instance.vector_store.delete_many = Mock(return_value=2)
+    memory_instance.db.add_history = Mock()
     memory_instance.graph.delete_all = Mock()
 
     result = memory_instance.delete_all(user_id="test_user")
 
-    assert memory_instance._delete_memory.call_count == 2
+    memory_instance.vector_store.count.assert_called_once_with(filters={"user_id": "test_user"})
+    memory_instance.vector_store.list.assert_called_once_with(filters={"user_id": "test_user"}, limit=2)
+    memory_instance.vector_store.delete_many.assert_called_once_with({"user_id": "test_user"})
+    assert memory_instance.db.add_history.call_count == 2
 
     if enable_graph:
         memory_instance.graph.delete_all.assert_called_once_with({"user_id": "test_user"})

@@ -4,7 +4,7 @@ import uuid
 from datetime import date, datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 from uuid import UUID
 
 import pyarrow as pa
@@ -19,7 +19,7 @@ from mem0.vector_stores.base import VectorStoreBase
 
 logger = logging.getLogger(__name__)
 
-RESERVED_COLUMNS = {"id", "vector", "payload_json"}
+RESERVED_COLUMNS = {"id", "vector", "payload_json", "search_text"}
 CORE_STRING_COLUMNS = (
     "data",
     "user_id",
@@ -32,11 +32,39 @@ CORE_STRING_COLUMNS = (
     "updated_at",
     "memory_type",
 )
+SEARCH_TEXT_COLUMN = "search_text"
+VECTOR_COLUMN = "vector"
+PAYLOAD_JSON_COLUMN = "payload_json"
+VECTOR_INDEX_NAME = "vector_idx"
+FTS_INDEX_NAME = "search_text_idx"
+VECTOR_INDEX_MIN_ROWS = 256
+SCALAR_INDEX_COLUMNS = (
+    ("user_id", "user_id_idx"),
+    ("agent_id", "agent_id_idx"),
+    ("run_id", "run_id_idx"),
+    ("actor_id", "actor_id_idx"),
+    ("memory_type", "memory_type_idx"),
+    ("role", "role_idx"),
+)
+SEARCH_TEXT_PRIORITY_FIELDS = (
+    "data",
+    "memory",
+    "text",
+    "tags",
+    "experience_label",
+    "topic",
+    "category",
+    "memory_type",
+    "role",
+    "actor_id",
+)
 
 
 class OutputData(BaseModel):
     id: Optional[str]
     score: Optional[float]
+    distance: Optional[float] = None
+    source: Optional[str] = None
     payload: Optional[Dict[str, Any]]
 
 
@@ -75,6 +103,7 @@ class LanceDB(VectorStoreBase):
         if table_name in self._list_tables():
             table = self.db.open_table(table_name)
             self._validate_vector_dimension(table, dims)
+            self._validate_required_columns(table)
         else:
             table = self.db.create_table(table_name, schema=self._build_schema(dims))
 
@@ -94,16 +123,27 @@ class LanceDB(VectorStoreBase):
             raise ValueError("Vectors, payloads, and ids must have the same length.")
 
         self._ensure_payload_columns(payloads)
+        had_rows = self.table.count_rows() > 0
         rows = [
             self._build_row(vector_id=vector_id, vector=vector, payload=payload)
             for vector_id, vector, payload in zip(ids, vectors, payloads)
         ]
         self.table.add(rows)
+        self._ensure_indexes(rebuild_fts=not had_rows)
 
     def search(
         self, query: str, vectors: List[float], limit: int = 5, filters: Optional[Dict] = None
     ) -> List[OutputData]:
-        if limit <= 0:
+        return self.search_semantic(query=query, vectors=vectors, limit=limit, filters=filters)
+
+    def search_semantic(
+        self,
+        query: str,
+        vectors: List[float],
+        limit: int = 5,
+        filters: Optional[Dict] = None,
+    ) -> List[OutputData]:
+        if limit <= 0 or self.table.count_rows() <= 0:
             return []
 
         query_vector = self._normalize_query_vector(vectors)
@@ -113,7 +153,51 @@ class LanceDB(VectorStoreBase):
             filter_expression = self._build_filter_expression(filters)
             query_builder = query_builder.where(filter_expression, prefilter=True)
 
-        return [self._row_to_output(row, include_score=True) for row in query_builder.to_list()]
+        return [self._row_to_output(row, include_score=True, source="semantic") for row in query_builder.to_list()]
+
+    def search_keyword(
+        self,
+        query: str,
+        *,
+        limit: int = 5,
+        filters: Optional[Dict] = None,
+    ) -> List[OutputData]:
+        normalized_query = str(query or "").strip()
+        if limit <= 0 or not normalized_query or self.table.count_rows() <= 0:
+            return []
+        self._ensure_fts_index(replace=False)
+        query_builder = self.table.search(
+            normalized_query,
+            query_type="fts",
+            fts_columns=SEARCH_TEXT_COLUMN,
+        ).limit(limit)
+        if filters:
+            filter_expression = self._build_filter_expression(filters)
+            query_builder = query_builder.where(filter_expression, prefilter=True)
+        return [self._row_to_output(row, include_score=True, source="keyword") for row in query_builder.to_list()]
+
+    def search_hybrid_candidates(
+        self,
+        *,
+        query: str,
+        vectors: List[float],
+        semantic_limit: int,
+        keyword_limit: int,
+        filters: Optional[Dict] = None,
+    ) -> Dict[str, List[OutputData]]:
+        return {
+            "semantic": self.search_semantic(
+                query=query,
+                vectors=vectors,
+                limit=semantic_limit,
+                filters=filters,
+            ),
+            "keyword": self.search_keyword(
+                query=query,
+                limit=keyword_limit,
+                filters=filters,
+            ),
+        }
 
     def delete(self, vector_id: str):
         self.table.delete(self._eq_expression("id", vector_id))
@@ -127,10 +211,11 @@ class LanceDB(VectorStoreBase):
         self._ensure_payload_columns([next_payload])
 
         update_values: Dict[str, Any] = {
-            "payload_json": self._serialize_payload(next_payload),
+            PAYLOAD_JSON_COLUMN: self._serialize_payload(next_payload),
+            SEARCH_TEXT_COLUMN: self._build_search_text(next_payload),
         }
         if vector is not None:
-            update_values["vector"] = self._normalize_stored_vector(vector)
+            update_values[VECTOR_COLUMN] = self._normalize_stored_vector(vector)
 
         for column_name in self._metadata_column_names():
             if column_name in next_payload:
@@ -177,6 +262,27 @@ class LanceDB(VectorStoreBase):
             query_builder = query_builder.where(self._build_filter_expression(filters))
         return [[self._row_to_output(row, include_score=False) for row in query_builder.to_list()]]
 
+    def count(self, filters: Optional[Dict] = None) -> int:
+        if filters:
+            return int(self.table.count_rows(filter=self._build_filter_expression(filters)))
+        return int(self.table.count_rows())
+
+    def delete_many(self, filters: Dict[str, Any]) -> int:
+        filter_expression = self._build_filter_expression(filters)
+        deleted_count = int(self.table.count_rows(filter=filter_expression))
+        if deleted_count <= 0:
+            return 0
+        delete_result = self.table.delete(filter_expression)
+        reported_deleted = getattr(delete_result, "num_deleted_rows", None)
+        if reported_deleted is not None:
+            deleted_count = int(reported_deleted)
+        if deleted_count > 0 and self.table.count_rows() > 0:
+            self.optimize()
+        return deleted_count
+
+    def optimize(self) -> None:
+        self.table.optimize()
+
     def reset(self):
         logger.warning("Resetting collection %s", self.table_name)
         self.delete_col()
@@ -185,14 +291,15 @@ class LanceDB(VectorStoreBase):
     def _build_schema(self, dims: int) -> pa.Schema:
         fields = [
             pa.field("id", pa.string(), nullable=False),
-            pa.field("vector", pa.list_(pa.float32(), dims), nullable=False),
-            pa.field("payload_json", pa.string(), nullable=False),
+            pa.field(VECTOR_COLUMN, pa.list_(pa.float32(), dims), nullable=False),
+            pa.field(PAYLOAD_JSON_COLUMN, pa.string(), nullable=False),
+            pa.field(SEARCH_TEXT_COLUMN, pa.string(), nullable=False),
         ]
         fields.extend(pa.field(column_name, pa.string()) for column_name in CORE_STRING_COLUMNS)
         return pa.schema(fields)
 
     def _validate_vector_dimension(self, table, expected_dims: int):
-        vector_field = table.schema.field("vector")
+        vector_field = table.schema.field(VECTOR_COLUMN)
         vector_type = vector_field.type
         if not pa.types.is_fixed_size_list(vector_type):
             raise ValueError(f"Table {self.table_name} does not use a fixed-size vector column.")
@@ -202,6 +309,14 @@ class LanceDB(VectorStoreBase):
             raise ValueError(
                 f"Embedding dimension mismatch for LanceDB table {self.table_name}: "
                 f"expected {expected_dims}, found {actual_dims}."
+            )
+
+    def _validate_required_columns(self, table) -> None:
+        required_columns = {PAYLOAD_JSON_COLUMN, SEARCH_TEXT_COLUMN}
+        missing = required_columns.difference(set(table.schema.names))
+        if missing:
+            raise ValueError(
+                f"LanceDB table {self.table_name} is missing required columns: {', '.join(sorted(missing))}."
             )
 
     def _ensure_payload_columns(self, payloads: Iterable[Optional[Dict[str, Any]]]):
@@ -234,8 +349,9 @@ class LanceDB(VectorStoreBase):
         payload_dict = payload.copy() if payload else {}
         row: Dict[str, Any] = {
             "id": vector_id,
-            "vector": self._normalize_stored_vector(vector),
-            "payload_json": self._serialize_payload(payload_dict),
+            VECTOR_COLUMN: self._normalize_stored_vector(vector),
+            PAYLOAD_JSON_COLUMN: self._serialize_payload(payload_dict),
+            SEARCH_TEXT_COLUMN: self._build_search_text(payload_dict),
         }
 
         for column_name in self._metadata_column_names():
@@ -267,12 +383,16 @@ class LanceDB(VectorStoreBase):
             return self._normalize_stored_vector(vector[0])
         return self._normalize_stored_vector(vector)
 
-    def _row_to_output(self, row: Dict[str, Any], include_score: bool) -> OutputData:
-        payload = self._deserialize_payload(row.get("payload_json"))
+    def _row_to_output(self, row: Dict[str, Any], include_score: bool, source: Optional[str] = None) -> OutputData:
+        payload = self._deserialize_payload(row.get(PAYLOAD_JSON_COLUMN))
         score = None
+        distance = None
         if include_score and row.get("_distance") is not None:
-            score = self._distance_to_score(float(row["_distance"]))
-        return OutputData(id=row.get("id"), score=score, payload=payload)
+            distance = float(row["_distance"])
+            score = self._distance_to_score(distance)
+        elif include_score and row.get("_score") is not None:
+            score = float(row["_score"])
+        return OutputData(id=row.get("id"), score=score, distance=distance, source=source, payload=payload)
 
     def _distance_to_score(self, distance: float) -> float:
         if self.distance_metric in {"cosine", "dot"}:
@@ -384,6 +504,9 @@ class LanceDB(VectorStoreBase):
     def _eq_expression(self, column_name: str, value: Any) -> str:
         return self._comparison_expression(self._sql_identifier(column_name), "eq", value, pa.string())
 
+    def _in_expression(self, column_name: str, values: Sequence[Any]) -> str:
+        return self._comparison_expression(self._sql_identifier(column_name), "in", list(values), pa.string())
+
     def _sql_identifier(self, column_name: str) -> str:
         escaped = column_name.replace("`", "``")
         return f"`{escaped}`"
@@ -473,3 +596,85 @@ class LanceDB(VectorStoreBase):
 
     def _json_default(self, value: Any) -> str:
         return str(self._json_safe_scalar(value))
+
+    def _build_search_text(self, payload: Dict[str, Any]) -> str:
+        parts: List[str] = []
+        seen: set[str] = set()
+
+        def add_value(value: Any) -> None:
+            if value is None:
+                return
+            if isinstance(value, (list, tuple, set)):
+                for item in value:
+                    add_value(item)
+                return
+            normalized = str(self._json_safe_scalar(value) or "").strip()
+            if not normalized or normalized in seen:
+                return
+            seen.add(normalized)
+            parts.append(normalized)
+
+        for field_name in SEARCH_TEXT_PRIORITY_FIELDS:
+            add_value(payload.get(field_name))
+        for key, value in payload.items():
+            if key in SEARCH_TEXT_PRIORITY_FIELDS:
+                continue
+            if key in {"user_id", "agent_id", "run_id", "created_at", "updated_at", "hash"}:
+                continue
+            add_value(value)
+        return "\n".join(parts)
+
+    def _ensure_indexes(self, *, rebuild_fts: bool = False) -> None:
+        self._ensure_scalar_indexes()
+        self._ensure_fts_index(replace=rebuild_fts)
+        self._ensure_vector_index()
+
+    def _ensure_scalar_indexes(self) -> None:
+        if self.table.count_rows() <= 0:
+            return
+        for column_name, index_name in SCALAR_INDEX_COLUMNS:
+            if column_name not in self.table.schema.names:
+                continue
+            if self._has_index(index_name):
+                continue
+            self.table.create_scalar_index(
+                column_name,
+                replace=False,
+                name=index_name,
+            )
+
+    def _ensure_fts_index(self, *, replace: bool = False) -> None:
+        if self.table.count_rows() <= 0:
+            return
+        if self._has_index(FTS_INDEX_NAME) and not replace:
+            return
+        self.table.create_fts_index(
+            SEARCH_TEXT_COLUMN,
+            replace=replace,
+            name=FTS_INDEX_NAME,
+            base_tokenizer="ngram",
+            ngram_min_length=2,
+            ngram_max_length=3,
+            lower_case=True,
+            stem=False,
+            remove_stop_words=False,
+            ascii_folding=False,
+        )
+
+    def _ensure_vector_index(self) -> None:
+        if self.table.count_rows() < VECTOR_INDEX_MIN_ROWS:
+            return
+        if self._has_index(VECTOR_INDEX_NAME):
+            return
+        self.table.create_index(
+            metric=self.distance_metric,
+            vector_column_name=VECTOR_COLUMN,
+            replace=False,
+            name=VECTOR_INDEX_NAME,
+        )
+
+    def _has_index(self, index_name: str) -> bool:
+        return any(
+            str(getattr(index, "name", "") or "").strip() == index_name
+            for index in list(self.table.list_indices())
+        )

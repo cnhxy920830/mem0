@@ -797,22 +797,14 @@ class Memory(MemoryBase):
         Returns:
             dict: A dictionary containing the search results, typically under a "results" key,
                   and potentially "relations" if graph store is enabled.
-                  Example for v1.1+: `{"results": [{"id": "...", "memory": "...", "score": 0.8, ...}]}`
+                  Example for v1.1+: `{"results": [{"id": "...", "memory": "...", "score": 0.8, ...}]}` 
         """
-        _, effective_filters = _build_filters_and_metadata(
-            user_id=user_id, agent_id=agent_id, run_id=run_id, input_filters=filters
+        effective_filters = self._resolve_search_filters(
+            user_id=user_id,
+            agent_id=agent_id,
+            run_id=run_id,
+            filters=filters,
         )
-
-        if not any(key in effective_filters for key in ("user_id", "agent_id", "run_id")):
-            raise ValueError("At least one of 'user_id', 'agent_id', or 'run_id' must be specified.")
-
-        # Apply enhanced metadata filtering if advanced operators are detected
-        if filters and self._has_advanced_operators(filters):
-            processed_filters = self._process_metadata_filters(filters)
-            effective_filters.update(processed_filters)
-        elif filters:
-            # Simple filters, merge directly
-            effective_filters.update(filters)
 
         keys, encoded_ids = process_telemetry_filters(effective_filters)
         capture_event(
@@ -854,6 +846,115 @@ class Memory(MemoryBase):
             return {"results": original_memories, "relations": graph_entities}
 
         return {"results": original_memories}
+
+    def search_semantic_candidates(
+        self,
+        query: str,
+        *,
+        user_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+        limit: int = 100,
+        filters: Optional[Dict[str, Any]] = None,
+        threshold: Optional[float] = None,
+    ) -> list[dict]:
+        effective_filters = self._resolve_search_filters(
+            user_id=user_id,
+            agent_id=agent_id,
+            run_id=run_id,
+            filters=filters,
+        )
+        return self._search_vector_store(query, effective_filters, limit, threshold)
+
+    def search_keyword_candidates(
+        self,
+        query: str,
+        *,
+        user_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+        limit: int = 100,
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> list[dict]:
+        effective_filters = self._resolve_search_filters(
+            user_id=user_id,
+            agent_id=agent_id,
+            run_id=run_id,
+            filters=filters,
+        )
+        search_keyword = getattr(self.vector_store, "search_keyword", None)
+        if not callable(search_keyword):
+            raise NotImplementedError("当前向量存储未实现关键词检索能力")
+        hits = search_keyword(query=query, limit=limit, filters=effective_filters)
+        return self._build_memory_items_from_outputs(hits)
+
+    def _resolve_search_filters(
+        self,
+        *,
+        user_id: Optional[str],
+        agent_id: Optional[str],
+        run_id: Optional[str],
+        filters: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        _, effective_filters = _build_filters_and_metadata(
+            user_id=user_id, agent_id=agent_id, run_id=run_id, input_filters=filters
+        )
+
+        if not any(key in effective_filters for key in ("user_id", "agent_id", "run_id")):
+            raise ValueError("At least one of 'user_id', 'agent_id', or 'run_id' must be specified.")
+
+        if filters and self._has_advanced_operators(filters):
+            processed_filters = self._process_metadata_filters(filters)
+            effective_filters.update(processed_filters)
+        elif filters:
+            effective_filters.update(filters)
+
+        return effective_filters
+
+    def _build_memory_items_from_outputs(
+        self,
+        memories,
+        *,
+        threshold: Optional[float] = None,
+    ) -> list[dict]:
+        promoted_payload_keys = [
+            "user_id",
+            "agent_id",
+            "run_id",
+            "actor_id",
+            "role",
+        ]
+
+        core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id", *promoted_payload_keys}
+        original_memories = []
+        for mem in memories:
+            payload = mem.payload or {}
+            memory_item_dict = MemoryItem(
+                id=mem.id,
+                memory=payload.get("data", ""),
+                hash=payload.get("hash"),
+                created_at=payload.get("created_at"),
+                updated_at=payload.get("updated_at"),
+                score=mem.score,
+            ).model_dump()
+
+            if getattr(mem, "distance", None) is not None:
+                memory_item_dict["distance"] = mem.distance
+            if getattr(mem, "source", None):
+                memory_item_dict["retrieval_source"] = mem.source
+
+            for key in promoted_payload_keys:
+                if key in payload:
+                    memory_item_dict[key] = payload[key]
+
+            additional_metadata = {k: v for k, v in payload.items() if k not in core_and_promoted_keys}
+            if additional_metadata:
+                memory_item_dict["metadata"] = additional_metadata
+
+            if threshold is None or mem.score is None or mem.score >= threshold:
+                original_memories.append(memory_item_dict)
+
+        return original_memories
 
     def _process_metadata_filters(self, metadata_filters: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -953,41 +1054,12 @@ class Memory(MemoryBase):
 
     def _search_vector_store(self, query, filters, limit, threshold: Optional[float] = None):
         embeddings = self.embedding_model.embed(query, "search")
-        memories = self.vector_store.search(query=query, vectors=embeddings, limit=limit, filters=filters)
-
-        promoted_payload_keys = [
-            "user_id",
-            "agent_id",
-            "run_id",
-            "actor_id",
-            "role",
-        ]
-
-        core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id", *promoted_payload_keys}
-
-        original_memories = []
-        for mem in memories:
-            memory_item_dict = MemoryItem(
-                id=mem.id,
-                memory=mem.payload.get("data", ""),
-                hash=mem.payload.get("hash"),
-                created_at=mem.payload.get("created_at"),
-                updated_at=mem.payload.get("updated_at"),
-                score=mem.score,
-            ).model_dump()
-
-            for key in promoted_payload_keys:
-                if key in mem.payload:
-                    memory_item_dict[key] = mem.payload[key]
-
-            additional_metadata = {k: v for k, v in mem.payload.items() if k not in core_and_promoted_keys}
-            if additional_metadata:
-                memory_item_dict["metadata"] = additional_metadata
-
-            if threshold is None or mem.score >= threshold:
-                original_memories.append(memory_item_dict)
-
-        return original_memories
+        search_semantic = getattr(self.vector_store, "search_semantic", None)
+        if callable(search_semantic):
+            memories = search_semantic(query=query, vectors=embeddings, limit=limit, filters=filters)
+        else:
+            memories = self.vector_store.search(query=query, vectors=embeddings, limit=limit, filters=filters)
+        return self._build_memory_items_from_outputs(memories, threshold=threshold)
 
     def update(self, memory_id, data):
         """
@@ -1046,13 +1118,18 @@ class Memory(MemoryBase):
 
         keys, encoded_ids = process_telemetry_filters(filters)
         capture_event("mem0.delete_all", self, {"keys": keys, "encoded_ids": encoded_ids, "sync_type": "sync"})
-        # delete all vector memories and reset the collections
-        memories = self.vector_store.list(filters=filters)[0]
-        for memory in memories:
-            self._delete_memory(memory.id)
-        self.vector_store.reset()
+        memories = self._list_memories_for_delete_all(filters)
+        delete_many = getattr(self.vector_store, "delete_many", None)
+        if callable(delete_many):
+            deleted_count = int(delete_many(filters))
+            for memory in memories:
+                self._record_deleted_memory_history(memory.id, memory.payload)
+        else:
+            for memory in memories:
+                self._delete_memory(memory.id)
+            deleted_count = len(memories)
 
-        logger.info(f"Deleted {len(memories)} memories")
+        logger.info(f"Deleted {deleted_count} memories")
 
         if self.enable_graph:
             self.graph.delete_all(filters)
@@ -1196,18 +1273,30 @@ class Memory(MemoryBase):
     def _delete_memory(self, memory_id):
         logger.info(f"Deleting memory with {memory_id=}")
         existing_memory = self.vector_store.get(vector_id=memory_id)
-        prev_value = existing_memory.payload.get("data", "")
         self.vector_store.delete(vector_id=memory_id)
+        self._record_deleted_memory_history(memory_id, existing_memory.payload)
+        return memory_id
+
+    def _record_deleted_memory_history(self, memory_id, payload):
+        payload = payload or {}
         self.db.add_history(
             memory_id,
-            prev_value,
+            payload.get("data", ""),
             None,
             "DELETE",
-            actor_id=existing_memory.payload.get("actor_id"),
-            role=existing_memory.payload.get("role"),
+            actor_id=payload.get("actor_id"),
+            role=payload.get("role"),
             is_deleted=1,
         )
-        return memory_id
+
+    def _list_memories_for_delete_all(self, filters):
+        count_fn = getattr(self.vector_store, "count", None)
+        if callable(count_fn):
+            total_memories = int(count_fn(filters=filters))
+            if total_memories <= 0:
+                return []
+            return self.vector_store.list(filters=filters, limit=total_memories)[0]
+        return self.vector_store.list(filters=filters)[0]
 
     def reset(self):
         """
@@ -2105,15 +2194,18 @@ class AsyncMemory(MemoryBase):
 
         keys, encoded_ids = process_telemetry_filters(filters)
         capture_event("mem0.delete_all", self, {"keys": keys, "encoded_ids": encoded_ids, "sync_type": "async"})
-        memories = await asyncio.to_thread(self.vector_store.list, filters=filters)
+        memories = await self._list_memories_for_delete_all(filters)
+        delete_many = getattr(self.vector_store, "delete_many", None)
+        if callable(delete_many):
+            deleted_count = int(await asyncio.to_thread(delete_many, filters))
+            for memory in memories:
+                await asyncio.to_thread(self._record_deleted_memory_history, memory.id, memory.payload)
+        else:
+            delete_tasks = [self._delete_memory(memory.id) for memory in memories]
+            await asyncio.gather(*delete_tasks)
+            deleted_count = len(memories)
 
-        delete_tasks = []
-        for memory in memories[0]:
-            delete_tasks.append(self._delete_memory(memory.id))
-
-        await asyncio.gather(*delete_tasks)
-
-        logger.info(f"Deleted {len(memories[0])} memories")
+        logger.info(f"Deleted {deleted_count} memories")
 
         if self.enable_graph:
             await asyncio.to_thread(self.graph.delete_all, filters)
@@ -2279,21 +2371,33 @@ class AsyncMemory(MemoryBase):
     async def _delete_memory(self, memory_id):
         logger.info(f"Deleting memory with {memory_id=}")
         existing_memory = await asyncio.to_thread(self.vector_store.get, vector_id=memory_id)
-        prev_value = existing_memory.payload.get("data", "")
-
         await asyncio.to_thread(self.vector_store.delete, vector_id=memory_id)
-        await asyncio.to_thread(
-            self.db.add_history,
-            memory_id,
-            prev_value,
-            None,
-            "DELETE",
-            actor_id=existing_memory.payload.get("actor_id"),
-            role=existing_memory.payload.get("role"),
-            is_deleted=1,
-        )
+        await asyncio.to_thread(self._record_deleted_memory_history, memory_id, existing_memory.payload)
 
         return memory_id
+
+    async def _list_memories_for_delete_all(self, filters):
+        count_fn = getattr(self.vector_store, "count", None)
+        if callable(count_fn):
+            total_memories = int(await asyncio.to_thread(count_fn, filters))
+            if total_memories <= 0:
+                return []
+            listed = await asyncio.to_thread(self.vector_store.list, filters=filters, limit=total_memories)
+            return listed[0]
+        listed = await asyncio.to_thread(self.vector_store.list, filters=filters)
+        return listed[0]
+
+    def _record_deleted_memory_history(self, memory_id, payload):
+        payload = payload or {}
+        self.db.add_history(
+            memory_id,
+            payload.get("data", ""),
+            None,
+            "DELETE",
+            actor_id=payload.get("actor_id"),
+            role=payload.get("role"),
+            is_deleted=1,
+        )
 
     async def reset(self):
         """
