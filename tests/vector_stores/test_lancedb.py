@@ -155,7 +155,7 @@ def test_lancedb_supports_keyword_search_and_batch_delete(lancedb_store: LanceDB
     assert keyword_hits[0].source == "keyword"
     assert keyword_hits[0].score is not None
 
-    candidate_sets = lancedb_store.search_hybrid_candidates(
+    hybrid_hits = lancedb_store.search_hybrid_candidates(
         query="timeout",
         vectors=[0.0, 1.0, 0.0],
         semantic_limit=3,
@@ -169,16 +169,69 @@ def test_lancedb_supports_keyword_search_and_batch_delete(lancedb_store: LanceDB
     assert "run_id_idx" in index_names
     assert "search_text_idx" in index_names
 
-    assert [hit.id for hit in candidate_sets["semantic"]] == ["kw-2", "kw-1"]
-    assert candidate_sets["keyword"]
-    assert candidate_sets["keyword"][0].id == "kw-2"
-    assert "kw-2" in [hit.id for hit in candidate_sets["keyword"]]
+    assert [hit.id for hit in hybrid_hits] == ["kw-2", "kw-1"]
+    assert hybrid_hits[0].source == "hybrid"
+    assert hybrid_hits[0].score is not None
     assert lancedb_store.count({"user_id": "alice"}) == 2
 
     deleted = lancedb_store.delete_many({"user_id": "alice"})
     assert deleted == 2
     assert lancedb_store.count({"user_id": "alice"}) == 0
     assert lancedb_store.count({"user_id": "bob"}) == 1
+
+def test_lancedb_keyword_search_supports_phrase_queries(lancedb_store: LanceDB):
+    lancedb_store.insert(
+        vectors=[
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ],
+        payloads=[
+            {
+                "data": "TypeScript strict mode rollout checklist",
+                "user_id": "alice",
+            },
+            {
+                "data": "strict checklist for TypeScript mode",
+                "user_id": "alice",
+            },
+        ],
+        ids=["phrase-1", "phrase-2"],
+    )
+
+    phrase_hits = lancedb_store.search_keyword(
+        '"TypeScript strict mode"',
+        limit=5,
+        filters={"user_id": "alice"},
+    )
+
+    assert [hit.id for hit in phrase_hits] == ["phrase-1"]
+    assert phrase_hits[0].source == "keyword"
+
+
+def test_lancedb_keyword_search_avoids_ngram_false_positives(lancedb_store: LanceDB):
+    lancedb_store.insert(
+        vectors=[
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ],
+        payloads=[
+            {
+                "data": "hello original term",
+                "user_id": "alice",
+            },
+            {
+                "data": "chrome timeout handling",
+                "user_id": "alice",
+            },
+        ],
+        ids=["fts-1", "fts-2"],
+    )
+
+    assert lancedb_store.search_keyword("updated", limit=5, filters={"user_id": "alice"}) == []
+    assert lancedb_store.search_keyword("rig", limit=5, filters={"user_id": "alice"}) == []
+
+    timeout_hits = lancedb_store.search_keyword("timeout", limit=5, filters={"user_id": "alice"})
+    assert [hit.id for hit in timeout_hits] == ["fts-2"]
 
 
 def test_lancedb_adds_dynamic_columns_across_batches(lancedb_store: LanceDB):

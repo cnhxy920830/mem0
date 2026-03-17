@@ -12,6 +12,7 @@ from pydantic import BaseModel
 
 try:
     import lancedb
+    from lancedb.rerankers import RRFReranker
 except ImportError as exc:
     raise ImportError("LanceDB vector store requires lancedb. Please install it using 'pip install lancedb'.") from exc
 
@@ -176,6 +177,39 @@ class LanceDB(VectorStoreBase):
             query_builder = query_builder.where(filter_expression, prefilter=True)
         return [self._row_to_output(row, include_score=True, source="keyword") for row in query_builder.to_list()]
 
+    def search_hybrid(
+        self,
+        query: str,
+        vectors: List[float],
+        *,
+        limit: int = 5,
+        filters: Optional[Dict] = None,
+    ) -> List[OutputData]:
+        normalized_query = str(query or "").strip()
+        if limit <= 0 or self.table.count_rows() <= 0:
+            return []
+        if not normalized_query:
+            return self.search_semantic(query=query, vectors=vectors, limit=limit, filters=filters)
+
+        self._ensure_fts_index(replace=False)
+        query_vector = self._normalize_query_vector(vectors)
+        query_builder = (
+            self.table.search(
+                query_type="hybrid",
+                vector_column_name=VECTOR_COLUMN,
+                fts_columns=SEARCH_TEXT_COLUMN,
+            )
+            .vector(query_vector)
+            .text(normalized_query)
+            .distance_type(self.distance_metric)
+            .rerank(RRFReranker(return_score="all"))
+            .limit(limit)
+        )
+        if filters:
+            filter_expression = self._build_filter_expression(filters)
+            query_builder = query_builder.where(filter_expression, prefilter=True)
+        return [self._row_to_output(row, include_score=True, source="hybrid") for row in query_builder.to_list()]
+
     def search_hybrid_candidates(
         self,
         *,
@@ -184,20 +218,13 @@ class LanceDB(VectorStoreBase):
         semantic_limit: int,
         keyword_limit: int,
         filters: Optional[Dict] = None,
-    ) -> Dict[str, List[OutputData]]:
-        return {
-            "semantic": self.search_semantic(
-                query=query,
-                vectors=vectors,
-                limit=semantic_limit,
-                filters=filters,
-            ),
-            "keyword": self.search_keyword(
-                query=query,
-                limit=keyword_limit,
-                filters=filters,
-            ),
-        }
+    ) -> List[OutputData]:
+        return self.search_hybrid(
+            query=query,
+            vectors=vectors,
+            limit=max(semantic_limit, keyword_limit),
+            filters=filters,
+        )
 
     def delete(self, vector_id: str):
         self.table.delete(self._eq_expression("id", vector_id))
@@ -387,7 +414,11 @@ class LanceDB(VectorStoreBase):
         payload = self._deserialize_payload(row.get(PAYLOAD_JSON_COLUMN))
         score = None
         distance = None
-        if include_score and row.get("_distance") is not None:
+        if include_score and row.get("_relevance_score") is not None:
+            score = float(row["_relevance_score"])
+            if row.get("_distance") is not None:
+                distance = float(row["_distance"])
+        elif include_score and row.get("_distance") is not None:
             distance = float(row["_distance"])
             score = self._distance_to_score(distance)
         elif include_score and row.get("_score") is not None:
@@ -652,13 +683,12 @@ class LanceDB(VectorStoreBase):
             SEARCH_TEXT_COLUMN,
             replace=replace,
             name=FTS_INDEX_NAME,
-            base_tokenizer="ngram",
-            ngram_min_length=2,
-            ngram_max_length=3,
+            base_tokenizer="simple",
             lower_case=True,
-            stem=False,
+            with_position=True,
+            stem=True,
             remove_stop_words=False,
-            ascii_folding=False,
+            ascii_folding=True,
         )
 
     def _ensure_vector_index(self) -> None:
