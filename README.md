@@ -102,7 +102,7 @@ If you want a filesystem-backed local vector store, build or install mem0 with L
 ```bash
 pip install -e ".[vector_stores]"
 python -m build
-pip install .\\dist\\mem0ai-1.0.5-py3-none-any.whl lancedb
+pip install .\\dist\\mem0ai-1.0.6.post1-py3-none-any.whl lancedb
 ```
 
 ```python

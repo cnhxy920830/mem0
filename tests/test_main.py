@@ -58,7 +58,7 @@ def memory_custom_instance():
 
         config = MemoryConfig(
             version="v1.1",
-            custom_fact_extraction_prompt="custom prompt extracting memory",
+            custom_fact_extraction_prompt="custom prompt extracting memory in json format",
             custom_update_memory_prompt="custom prompt determining memory update",
         )
         config.graph_store.config = {"some_config": "value"}
@@ -126,6 +126,7 @@ def test_search(memory_instance, version, enable_graph):
         Mock(id="1", payload={"data": "Memory 1", "user_id": "test_user"}, score=0.9),
         Mock(id="2", payload={"data": "Memory 2", "user_id": "test_user"}, score=0.8),
     ]
+    memory_instance.vector_store.search_semantic = Mock(return_value=mock_memories)
     memory_instance.vector_store.search = Mock(return_value=mock_memories)
     memory_instance.embedding_model.embed = Mock(return_value=[0.1, 0.2, 0.3])
     memory_instance.graph.search = Mock(return_value=[{"relation": "test_relation"}])
@@ -153,9 +154,10 @@ def test_search(memory_instance, version, enable_graph):
         assert result["results"][0]["user_id"] == "test_user"
         assert result["results"][0]["score"] == 0.9
 
-    memory_instance.vector_store.search.assert_called_once_with(
+    memory_instance.vector_store.search_semantic.assert_called_once_with(
         query="test query", vectors=[0.1, 0.2, 0.3], limit=100, filters={"user_id": "test_user"}
     )
+    memory_instance.vector_store.search.assert_not_called()
     memory_instance.embedding_model.embed.assert_called_once_with("test query", "search")
 
     if enable_graph:
@@ -198,8 +200,38 @@ def test_delete_all(memory_instance, version, enable_graph):
     ]
     memory_instance.vector_store.count = Mock(return_value=2)
     memory_instance.vector_store.list = Mock(return_value=(mock_memories, None))
+    memory_instance.vector_store.delete_many = None
+    memory_instance.vector_store.reset = Mock()
+    memory_instance._delete_memory = Mock()
+    memory_instance.graph.delete_all = Mock()
+
+    result = memory_instance.delete_all(user_id="test_user")
+
+    assert memory_instance._delete_memory.call_count == 2
+    memory_instance.vector_store.reset.assert_not_called()
+
+    if enable_graph:
+        memory_instance.graph.delete_all.assert_called_once_with({"user_id": "test_user"})
+    else:
+        memory_instance.graph.delete_all.assert_not_called()
+
+    assert result["message"] == "Memories deleted successfully!"
+
+
+@pytest.mark.parametrize("version, enable_graph", [("v1.0", False), ("v1.1", True)])
+def test_delete_all_uses_delete_many_when_available(memory_instance, version, enable_graph):
+    memory_instance.config.version = version
+    memory_instance.enable_graph = enable_graph
+    mock_memories = [
+        Mock(id="1", payload={"data": "Memory 1", "actor_id": "actor-1", "role": "user"}),
+        Mock(id="2", payload={"data": "Memory 2", "actor_id": "actor-2", "role": "assistant"}),
+    ]
+    memory_instance.vector_store.count = Mock(return_value=2)
+    memory_instance.vector_store.list = Mock(return_value=(mock_memories, None))
     memory_instance.vector_store.delete_many = Mock(return_value=2)
+    memory_instance.vector_store.reset = Mock()
     memory_instance.db.add_history = Mock()
+    memory_instance._delete_memory = Mock()
     memory_instance.graph.delete_all = Mock()
 
     result = memory_instance.delete_all(user_id="test_user")
@@ -208,6 +240,8 @@ def test_delete_all(memory_instance, version, enable_graph):
     memory_instance.vector_store.list.assert_called_once_with(filters={"user_id": "test_user"}, limit=2)
     memory_instance.vector_store.delete_many.assert_called_once_with({"user_id": "test_user"})
     assert memory_instance.db.add_history.call_count == 2
+    memory_instance._delete_memory.assert_not_called()
+    memory_instance.vector_store.reset.assert_not_called()
 
     if enable_graph:
         memory_instance.graph.delete_all.assert_called_once_with({"user_id": "test_user"})
@@ -302,3 +336,43 @@ def test_custom_prompts(memory_custom_instance):
                 messages=[{"role": "user", "content": mock_get_update_memory_messages.return_value}],
                 response_format={"type": "json_object"},
             )
+
+
+def test_no_telemetry_vector_store_when_disabled():
+    """VectorStoreFactory should only be called once (for user data) when telemetry is disabled."""
+    with (
+        patch("mem0.memory.main.MEM0_TELEMETRY", False),
+        patch("mem0.utils.factory.EmbedderFactory") as mock_embedder,
+        patch("mem0.memory.main.VectorStoreFactory") as mock_vector_store,
+        patch("mem0.utils.factory.LlmFactory") as mock_llm,
+        patch("mem0.memory.telemetry.capture_event"),
+    ):
+        mock_embedder.create.return_value = Mock()
+        mock_vector_store.create.return_value = Mock()
+        mock_llm.create.return_value = Mock()
+
+        config = MemoryConfig(version="v1.1")
+        Memory(config)
+
+        # VectorStoreFactory.create should be called exactly once — for user data only, not telemetry
+        assert mock_vector_store.create.call_count == 1
+
+
+def test_telemetry_vector_store_created_when_enabled():
+    """VectorStoreFactory should be called twice (user data + telemetry) when telemetry is enabled."""
+    with (
+        patch("mem0.memory.main.MEM0_TELEMETRY", True),
+        patch("mem0.utils.factory.EmbedderFactory") as mock_embedder,
+        patch("mem0.memory.main.VectorStoreFactory") as mock_vector_store,
+        patch("mem0.utils.factory.LlmFactory") as mock_llm,
+        patch("mem0.memory.telemetry.capture_event"),
+    ):
+        mock_embedder.create.return_value = Mock()
+        mock_vector_store.create.return_value = Mock()
+        mock_llm.create.return_value = Mock()
+
+        config = MemoryConfig(version="v1.1")
+        Memory(config)
+
+        # VectorStoreFactory.create should be called twice — user data + telemetry
+        assert mock_vector_store.create.call_count == 2
