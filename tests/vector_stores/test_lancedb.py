@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+from lancedb.rerankers import RRFReranker
 
 from mem0.utils.factory import VectorStoreFactory
 from mem0.vector_stores.configs import VectorStoreConfig
@@ -67,7 +68,9 @@ def test_lancedb_crud_and_filtering(lancedb_store: LanceDB):
 
     assert [hit.id for hit in hits] == ["mem-1"]
     assert hits[0].payload["category"] == "preferences"
-    assert pytest.approx(hits[0].score, rel=1e-6) == 1.0
+    assert pytest.approx(hits[0].distance, rel=1e-6) == 0.0
+    assert hits[0].score is None
+    assert hits[0].relevance_score is None
 
     memories = lancedb_store.list(
         filters={
@@ -154,6 +157,8 @@ def test_lancedb_supports_keyword_search_and_batch_delete(lancedb_store: LanceDB
     assert "kw-1" in [hit.id for hit in keyword_hits]
     assert keyword_hits[0].source == "keyword"
     assert keyword_hits[0].score is not None
+    assert keyword_hits[0].distance is None
+    assert keyword_hits[0].relevance_score is None
 
     hybrid_hits = lancedb_store.search_hybrid_candidates(
         query="timeout",
@@ -172,6 +177,8 @@ def test_lancedb_supports_keyword_search_and_batch_delete(lancedb_store: LanceDB
     assert [hit.id for hit in hybrid_hits] == ["kw-2", "kw-1"]
     assert hybrid_hits[0].source == "hybrid"
     assert hybrid_hits[0].score is not None
+    assert hybrid_hits[0].distance is not None
+    assert hybrid_hits[0].relevance_score is not None
     assert lancedb_store.count({"user_id": "alice"}) == 2
 
     deleted = lancedb_store.delete_many({"user_id": "alice"})
@@ -232,6 +239,78 @@ def test_lancedb_keyword_search_avoids_ngram_false_positives(lancedb_store: Lanc
 
     timeout_hits = lancedb_store.search_keyword("timeout", limit=5, filters={"user_id": "alice"})
     assert [hit.id for hit in timeout_hits] == ["fts-2"]
+
+
+def test_lancedb_search_returns_official_raw_fields(lancedb_store: LanceDB):
+    lancedb_store.insert(
+        vectors=[
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        payloads=[
+            {"data": "TypeScript strict mode rollout checklist", "user_id": "alice"},
+            {"data": "Chrome DevTools MCP timeout handling SOP", "user_id": "alice"},
+            {"data": "Rust service deployment notes", "user_id": "alice"},
+        ],
+        ids=["raw-1", "raw-2", "raw-3"],
+    )
+
+    semantic_raw = (
+        lancedb_store.table.search([0.0, 1.0, 0.0])
+        .distance_type(lancedb_store.distance_metric)
+        .limit(3)
+        .to_list()
+    )
+    semantic_hits = lancedb_store.search_semantic(
+        query="timeout",
+        vectors=[0.0, 1.0, 0.0],
+        limit=3,
+        filters={"user_id": "alice"},
+    )
+    assert semantic_hits[0].id == semantic_raw[0]["id"]
+    assert semantic_hits[0].distance == pytest.approx(float(semantic_raw[0]["_distance"]), rel=1e-6)
+    assert semantic_hits[0].score is None
+    assert semantic_hits[0].relevance_score is None
+
+    keyword_hits = lancedb_store.search_keyword("timeout", limit=3, filters={"user_id": "alice"})
+    keyword_raw = (
+        lancedb_store.table.search(
+            "timeout",
+            query_type="fts",
+            fts_columns="search_text",
+        )
+        .limit(3)
+        .to_list()
+    )
+    assert keyword_hits[0].id == keyword_raw[0]["id"]
+    assert keyword_hits[0].score == pytest.approx(float(keyword_raw[0]["_score"]), rel=1e-6)
+    assert keyword_hits[0].distance is None
+    assert keyword_hits[0].relevance_score is None
+
+    hybrid_raw = (
+        lancedb_store.table.search(
+            query_type="hybrid",
+            vector_column_name="vector",
+            fts_columns="search_text",
+        )
+        .vector([0.0, 1.0, 0.0])
+        .text("timeout")
+        .distance_type(lancedb_store.distance_metric)
+        .rerank(RRFReranker(return_score="all"))
+        .limit(3)
+        .to_list()
+    )
+    hybrid_hits = lancedb_store.search_hybrid(
+        query="timeout",
+        vectors=[0.0, 1.0, 0.0],
+        limit=3,
+        filters={"user_id": "alice"},
+    )
+    assert hybrid_hits[0].id == hybrid_raw[0]["id"]
+    assert hybrid_hits[0].relevance_score == pytest.approx(float(hybrid_raw[0]["_relevance_score"]), rel=1e-6)
+    assert hybrid_hits[0].distance == pytest.approx(float(hybrid_raw[0]["_distance"]), rel=1e-6)
+    assert hybrid_hits[0].score == pytest.approx(float(hybrid_raw[0]["_score"]), rel=1e-6)
 
 
 def test_lancedb_adds_dynamic_columns_across_batches(lancedb_store: LanceDB):

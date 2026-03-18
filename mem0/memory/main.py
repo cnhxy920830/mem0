@@ -941,10 +941,12 @@ class Memory(MemoryBase):
                 created_at=payload.get("created_at"),
                 updated_at=payload.get("updated_at"),
                 score=mem.score,
-            ).model_dump()
+            ).model_dump(exclude_none=True)
 
             if getattr(mem, "distance", None) is not None:
                 memory_item_dict["distance"] = mem.distance
+            if getattr(mem, "relevance_score", None) is not None:
+                memory_item_dict["relevance_score"] = mem.relevance_score
             if getattr(mem, "source", None):
                 memory_item_dict["retrieval_source"] = mem.source
 
@@ -2122,24 +2124,30 @@ class AsyncMemory(MemoryBase):
 
         original_memories = []
         for mem in memories:
+            payload = mem.payload or {}
             memory_item_dict = MemoryItem(
                 id=mem.id,
-                memory=mem.payload.get("data", ""),
-                hash=mem.payload.get("hash"),
-                created_at=mem.payload.get("created_at"),
-                updated_at=mem.payload.get("updated_at"),
+                memory=payload.get("data", ""),
+                hash=payload.get("hash"),
+                created_at=payload.get("created_at"),
+                updated_at=payload.get("updated_at"),
                 score=mem.score,
-            ).model_dump()
+            ).model_dump(exclude_none=True)
+
+            if getattr(mem, "distance", None) is not None:
+                memory_item_dict["distance"] = mem.distance
+            if getattr(mem, "relevance_score", None) is not None:
+                memory_item_dict["relevance_score"] = mem.relevance_score
 
             for key in promoted_payload_keys:
-                if key in mem.payload:
-                    memory_item_dict[key] = mem.payload[key]
+                if key in payload:
+                    memory_item_dict[key] = payload[key]
 
-            additional_metadata = {k: v for k, v in mem.payload.items() if k not in core_and_promoted_keys}
+            additional_metadata = {k: v for k, v in payload.items() if k not in core_and_promoted_keys}
             if additional_metadata:
                 memory_item_dict["metadata"] = additional_metadata
 
-            if threshold is None or mem.score >= threshold:
+            if threshold is None or mem.score is None or mem.score >= threshold:
                 original_memories.append(memory_item_dict)
 
         return original_memories

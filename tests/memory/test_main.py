@@ -127,3 +127,35 @@ class TestAsyncAddToVectorStoreErrors:
         assert result == []
         assert "Empty response from LLM, no memories to extract" in caplog.text
         assert mock_capture_event.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_async_search_vector_store_preserves_raw_lancedb_fields(self, mock_async_memory):
+        mock_async_memory.embedding_model.embed.return_value = [0.1, 0.2, 0.3]
+        mock_async_memory.vector_store.search.return_value = [
+            MagicMock(
+                id="semantic-1",
+                payload={"data": "Semantic memory", "user_id": "test_user"},
+                score=None,
+                distance=0.12,
+                relevance_score=None,
+            ),
+            MagicMock(
+                id="hybrid-1",
+                payload={"data": "Hybrid memory", "user_id": "test_user"},
+                score=0.91,
+                distance=0.0,
+                relevance_score=0.03,
+            ),
+        ]
+
+        results = await mock_async_memory._search_vector_store("test query", {"user_id": "test_user"}, 5)
+
+        assert results[0]["id"] == "semantic-1"
+        assert results[0]["distance"] == 0.12
+        assert "score" not in results[0]
+        assert "relevance_score" not in results[0]
+
+        assert results[1]["id"] == "hybrid-1"
+        assert results[1]["score"] == 0.91
+        assert results[1]["distance"] == 0.0
+        assert results[1]["relevance_score"] == 0.03

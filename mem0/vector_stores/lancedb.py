@@ -65,6 +65,7 @@ class OutputData(BaseModel):
     id: Optional[str]
     score: Optional[float]
     distance: Optional[float] = None
+    relevance_score: Optional[float] = None
     source: Optional[str] = None
     payload: Optional[Dict[str, Any]]
 
@@ -414,21 +415,25 @@ class LanceDB(VectorStoreBase):
         payload = self._deserialize_payload(row.get(PAYLOAD_JSON_COLUMN))
         score = None
         distance = None
+        relevance_score = None
         if include_score and row.get("_relevance_score") is not None:
-            score = float(row["_relevance_score"])
+            relevance_score = float(row["_relevance_score"])
             if row.get("_distance") is not None:
                 distance = float(row["_distance"])
+            if row.get("_score") is not None:
+                score = float(row["_score"])
         elif include_score and row.get("_distance") is not None:
             distance = float(row["_distance"])
-            score = self._distance_to_score(distance)
         elif include_score and row.get("_score") is not None:
             score = float(row["_score"])
-        return OutputData(id=row.get("id"), score=score, distance=distance, source=source, payload=payload)
-
-    def _distance_to_score(self, distance: float) -> float:
-        if self.distance_metric in {"cosine", "dot"}:
-            return 1.0 - distance
-        return 1.0 / (1.0 + distance)
+        return OutputData(
+            id=row.get("id"),
+            score=score,
+            distance=distance,
+            relevance_score=relevance_score,
+            source=source,
+            payload=payload,
+        )
 
     def _build_filter_expression(self, filters: Dict[str, Any]) -> str:
         expression = self._build_nested_filter_expression(filters)

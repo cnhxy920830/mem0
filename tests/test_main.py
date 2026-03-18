@@ -166,6 +166,41 @@ def test_search(memory_instance, version, enable_graph):
         memory_instance.graph.search.assert_not_called()
 
 
+def test_build_memory_items_from_outputs_preserves_raw_lancedb_fields(memory_instance):
+    memories = [
+        Mock(
+            id="semantic-1",
+            payload={"data": "Semantic memory", "user_id": "test_user"},
+            score=None,
+            distance=0.12,
+            relevance_score=None,
+            source="semantic",
+        ),
+        Mock(
+            id="hybrid-1",
+            payload={"data": "Hybrid memory", "user_id": "test_user"},
+            score=0.91,
+            distance=0.0,
+            relevance_score=0.03,
+            source="hybrid",
+        ),
+    ]
+
+    results = memory_instance._build_memory_items_from_outputs(memories)
+
+    assert results[0]["id"] == "semantic-1"
+    assert results[0]["distance"] == 0.12
+    assert results[0]["retrieval_source"] == "semantic"
+    assert "score" not in results[0]
+    assert "relevance_score" not in results[0]
+
+    assert results[1]["id"] == "hybrid-1"
+    assert results[1]["score"] == 0.91
+    assert results[1]["distance"] == 0.0
+    assert results[1]["relevance_score"] == 0.03
+    assert results[1]["retrieval_source"] == "hybrid"
+
+
 def test_update(memory_instance):
     memory_instance.embedding_model = Mock()
     memory_instance.embedding_model.embed = Mock(return_value=[0.1, 0.2, 0.3])
